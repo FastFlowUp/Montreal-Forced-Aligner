@@ -1,6 +1,7 @@
 """Command line functions for aligning single files"""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pywrapfst
@@ -76,6 +77,18 @@ __all__ = ["align_one_cli"]
     type=click.Choice(["long_textgrid", "short_textgrid", "json", "csv"]),
 )
 @click.option(
+    "--save_phone_confidence",
+    is_flag=True,
+    help="Write phone confidence JSON sidecar next to OUTPUT_PATH as <output_stem>_confidence.json.",
+    default=False,
+)
+@click.option(
+    "--phone_confidence_path",
+    help="Optional explicit path for phone confidence JSON output (overrides default sidecar location).",
+    type=click.Path(file_okay=True, dir_okay=False, path_type=Path),
+    default=None,
+)
+@click.option(
     "--no_tokenization",
     is_flag=True,
     help="Flag to disable any pretrained tokenization.",
@@ -107,15 +120,21 @@ def align_one_cli(context, **kwargs) -> None:
     no_tokenization = kwargs["no_tokenization"]
     g2p_model_path = kwargs.get("g2p_model_path", None)
 
+    save_phone_confidence = kwargs.get("save_phone_confidence", False)
+    phone_confidence_path: Path | None = kwargs.get("phone_confidence_path", None)
+
     acoustic_model = AcousticModel(acoustic_model_path)
     g2p_model = None
     if g2p_model_path:
         g2p_model_path = validate_g2p_model(context, kwargs, g2p_model_path)
         g2p_model = G2PModel(g2p_model_path)
+
     c = PretrainedAligner.parse_parameters(config_path, context.params, context.args)
+
     extracted_models_dir = config.TEMPORARY_DIRECTORY.joinpath("extracted_models", "dictionary")
     dictionary_directory = extracted_models_dir.joinpath(dictionary_path.stem)
     dictionary_directory.mkdir(parents=True, exist_ok=True)
+
     lexicon_compiler = LexiconCompiler(
         disambiguation=False,
         silence_probability=acoustic_model.parameters["silence_probability"],
@@ -128,6 +147,7 @@ def align_one_cli(context, **kwargs) -> None:
         phones=acoustic_model.parameters["non_silence_phones"],
         ignore_case=c.get("ignore_case", True),
     )
+
     l_fst_path = dictionary_directory.joinpath("L.fst")
     l_align_fst_path = dictionary_directory.joinpath("L_align.fst")
     words_path = dictionary_directory.joinpath("words.txt")
@@ -158,11 +178,13 @@ def align_one_cli(context, **kwargs) -> None:
         )
     else:
         tokenizer = generate_language_tokenizer(acoustic_model.language)
+
     file_name = sound_file_path.stem
     file = FileData.parse_file(file_name, sound_file_path, text_file_path, "", 0)
     file_ctm = HierarchicalCtm([])
     utterances = []
     cmvn_computer = CmvnComputer()
+
     for utterance in file.utterances:
         seg = Segment(sound_file_path, utterance.begin, utterance.end, utterance.channel)
         normalized_text = tokenize_utterance_text(
@@ -177,6 +199,7 @@ def align_one_cli(context, **kwargs) -> None:
         utterances.append(utt)
 
     cmvn = cmvn_computer.compute_cmvn_from_features([utt.mfccs for utt in utterances])
+
     align_options = {
         k: v
         for k, v in c.items()
@@ -190,18 +213,50 @@ def align_one_cli(context, **kwargs) -> None:
             "boost_silence",
         ]
     }
+
     if g2p_model is not None or not (l_fst_path.exists() and not config.CLEAN):
         lexicon_compiler.fst.write(str(l_fst_path))
         lexicon_compiler.align_fst.write(str(l_align_fst_path))
         lexicon_compiler.word_table.write_text(words_path)
         lexicon_compiler.phone_table.write_text(phones_path)
+
     kalpy_aligner = KalpyAligner(acoustic_model, lexicon_compiler, **align_options)
     for utt in utterances:
         utt.apply_cmvn(cmvn)
         ctm = kalpy_aligner.align_utterance(utt)
         file_ctm.word_intervals.extend(ctm.word_intervals)
+
     if str(output_path) != "-":
         output_path.parent.mkdir(parents=True, exist_ok=True)
-    file_ctm.export_textgrid(
-        output_path, file_duration=file.wav_info.duration, output_format=output_format
-    )
+
+    file_ctm.export_textgrid(output_path, file_duration=file.wav_info.duration, output_format=output_format)
+
+    should_write_confidence = (save_phone_confidence or phone_confidence_path is not None) and str(output_path) != "-"
+    if should_write_confidence:
+        if phone_confidence_path is None:
+            phone_confidence_path = output_path.with_name(output_path.stem + "_confidence.json")
+        else:
+            phone_confidence_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload: dict = {"words": []}
+        for word_interval in file_ctm.word_intervals:
+            w_entry = {
+                "begin": word_interval.begin,
+                "end": word_interval.end,
+                "word": word_interval.label,
+                "phones": [],
+            }
+            for phone_interval in word_interval.phones:
+                w_entry["phones"].append(
+                    {
+                        "begin": phone_interval.begin,
+                        "end": phone_interval.end,
+                        "phone": phone_interval.label,
+                        "confidence": phone_interval.confidence,
+                    }
+                )
+            payload["words"].append(w_entry)
+
+        with open(phone_confidence_path, "w", encoding="utf8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.write("\n")
